@@ -1,0 +1,313 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>iPad Multiplayer Racer</title>
+    <style>
+        /* --- DESIGN --- */
+        body { margin: 0; overflow: hidden; background: #111; font-family: sans-serif; touch-action: none; }
+        canvas { display: block; background: #222; }
+        
+        /* UI Overlay */
+        #ui { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; }
+        
+        /* Menü */
+        #menu {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            background: rgba(0,0,0,0.8); padding: 20px; border: 2px solid cyan;
+            border-radius: 10px; text-align: center; color: white; pointer-events: auto;
+            backdrop-filter: blur(5px);
+        }
+        h1 { margin: 0 0 20px 0; color: cyan; text-shadow: 0 0 10px cyan; font-style: italic; }
+        button {
+            background: cyan; border: none; padding: 10px 20px; font-size: 18px; 
+            font-weight: bold; cursor: pointer; margin: 5px; border-radius: 5px;
+        }
+        button:active { background: white; }
+        
+        /* Touch Controls (iPad Style) */
+        .controls { display: none; pointer-events: auto; }
+        .btn {
+            position: absolute; width: 80px; height: 80px; 
+            background: rgba(255, 255, 255, 0.1); border: 2px solid rgba(255,255,255,0.3);
+            border-radius: 50%; color: white; font-size: 30px; 
+            display: flex; justify-content: center; align-items: center; user-select: none;
+        }
+        .btn:active { background: rgba(0, 255, 255, 0.3); border-color: cyan; }
+        
+        #btnLeft { bottom: 20px; left: 20px; }
+        #btnRight { bottom: 20px; left: 110px; }
+        #btnGas { bottom: 20px; right: 20px; background: rgba(0, 255, 0, 0.1); }
+        #btnBrake { bottom: 20px; right: 110px; width: 60px; height: 60px; background: rgba(255, 0, 0, 0.1); }
+
+        /* Einstellungen Panel */
+        #settings { display: none; text-align: left; margin-top: 10px; border-top: 1px solid gray; padding-top: 10px; }
+    </style>
+</head>
+<body>
+
+    <canvas id="gameCanvas"></canvas>
+
+    <div id="ui">
+        <!-- Start Menü -->
+        <div id="menu">
+            <h1>NEON RACER</h1>
+            <button onclick="startGame()">RENNEN STARTEN</button>
+            <button onclick="toggleSettings()">⚙️ Einstellungen</button>
+            
+            <div id="settings">
+                <label style="display:block; margin:5px 0;">
+                    <input type="checkbox" id="checkBots" checked> Bots aktivieren
+                </label>
+                <label style="display:block; margin:5px 0;">
+                    <input type="checkbox" id="checkTouch" checked> Touch-Steuerung
+                </label>
+            </div>
+        </div>
+
+        <!-- Steuerung -->
+        <div id="touchControls" class="controls">
+            <div class="btn" id="btnLeft">◀</div>
+            <div class="btn" id="btnRight">▶</div>
+            <div class="btn" id="btnBrake">🛑</div>
+            <div class="btn" id="btnGas">▲</div>
+        </div>
+    </div>
+
+    <!-- Socket.io direkt laden (Replit stellt das bereit) -->
+    <script src="/socket.io/socket.io.js"></script>
+
+    <script>
+        // === KONFIGURATION ===
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        let socket;
+        
+        // Versuche Socket zu verbinden (falls Backend läuft)
+        try { socket = io(); } catch(e) { console.log("Offline Modus / Kein Backend gefunden"); }
+
+        let gameState = 'MENU'; // MENU, PLAY
+        
+        // Physik Variablen
+        const CAR_SIZE = 20;
+        const ACCELERATION = 0.2;
+        const MAX_SPEED = 10;
+        const FRICTION = 0.97;
+        const TURN_SPEED = 0.06;
+
+        // Spieler
+        let me = { x: 400, y: 300, angle: 0, speed: 0, color: '#0ff' };
+        let others = {}; // Multiplayer Gegner
+        let bots = [];   // KI Gegner
+
+        // Inputs
+        let keys = {};
+        let touch = { up: false, down: false, left: false, right: false };
+
+        // Resize Canvas
+        function resize() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.onresize = resize;
+        resize();
+
+        // === STRECKEN DESIGN ===
+        // Einfacher Rundkurs aus Punkten
+        const trackPoints = [
+            {x: 200, y: 200}, {x: 600, y: 200}, {x: 900, y: 400},
+            {x: 600, y: 600}, {x: 200, y: 600}
+        ];
+
+        // === BOT KLASSE ===
+        class Bot {
+            constructor() {
+                this.x = 200 + Math.random() * 50;
+                this.y = 200;
+                this.angle = 0;
+                this.speed = 5 + Math.random() * 3;
+                this.color = '#ff0055';
+                this.targetIndex = 1;
+            }
+            update() {
+                let target = trackPoints[this.targetIndex];
+                let dx = target.x - this.x;
+                let dy = target.y - this.y;
+                let dist = Math.sqrt(dx*dx + dy*dy);
+                
+                // Lenken zum Ziel
+                let targetAngle = Math.atan2(dy, dx);
+                let diff = targetAngle - this.angle;
+                // Winkel normalisieren (-PI bis PI)
+                while (diff > Math.PI) diff -= Math.PI * 2;
+                while (diff < -Math.PI) diff += Math.PI * 2;
+                
+                this.angle += diff * 0.1; // Sanftes Lenken
+                this.x += Math.cos(this.angle) * this.speed;
+                this.y += Math.sin(this.angle) * this.speed;
+
+                // Nächster Wegpunkt
+                if (dist < 100) {
+                    this.targetIndex = (this.targetIndex + 1) % trackPoints.length;
+                }
+            }
+            draw() { drawCar(this.x, this.y, this.angle, this.color); }
+        }
+
+        // === SPIEL LOGIK ===
+        function startGame() {
+            document.getElementById('menu').style.display = 'none';
+            
+            // Einstellungen prüfen
+            if (document.getElementById('checkTouch').checked) {
+                document.getElementById('touchControls').style.display = 'block';
+            }
+            
+            if (document.getElementById('checkBots').checked) {
+                for(let i=0; i<3; i++) bots.push(new Bot());
+            }
+
+            gameState = 'PLAY';
+            loop();
+        }
+
+        function toggleSettings() {
+            let el = document.getElementById('settings');
+            el.style.display = (el.style.display === 'block') ? 'none' : 'block';
+        }
+
+        // Steuerung Events (Keyboard)
+        window.addEventListener('keydown', e => keys[e.key] = true);
+        window.addEventListener('keyup', e => keys[e.key] = false);
+
+        // Steuerung Events (Touch)
+        function bindTouch(id, key) {
+            let el = document.getElementById(id);
+            el.addEventListener('touchstart', (e) => { e.preventDefault(); touch[key] = true; });
+            el.addEventListener('touchend', (e) => { e.preventDefault(); touch[key] = false; });
+        }
+        bindTouch('btnGas', 'up');
+        bindTouch('btnBrake', 'down');
+        bindTouch('btnLeft', 'left');
+        bindTouch('btnRight', 'right');
+
+        // === GAME LOOP ===
+        function loop() {
+            if (gameState !== 'PLAY') return;
+
+            // 1. Physik Update
+            if (keys['ArrowUp'] || keys['w'] || touch.up) me.speed += ACCELERATION;
+            if (keys['ArrowDown'] || keys['s'] || touch.down) me.speed -= ACCELERATION;
+            
+            // Lenken nur wenn man fährt
+            if (Math.abs(me.speed) > 0.1) {
+                if (keys['ArrowLeft'] || keys['a'] || touch.left) me.angle -= TURN_SPEED;
+                if (keys['ArrowRight'] || keys['d'] || touch.right) me.angle += TURN_SPEED;
+            }
+
+            me.speed *= FRICTION; // Reibung
+            me.x += Math.cos(me.angle) * me.speed;
+            me.y += Math.sin(me.angle) * me.speed;
+
+            // Multiplayer Update senden
+            if(socket) {
+                socket.emit('playerMovement', { x: me.x, y: me.y, angle: me.angle });
+            }
+
+            // Bots bewegen
+            bots.forEach(bot => bot.update());
+
+            // 2. Zeichnen
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Kamera folgen (optional simple Verschiebung)
+            ctx.save();
+            // Kamera zentrieren auf Spieler
+            ctx.translate(canvas.width/2 - me.x, canvas.height/2 - me.y);
+
+            drawTrack();
+
+            // Andere Spieler zeichnen
+            for (let id in others) {
+                let p = others[id];
+                drawCar(p.x, p.y, p.angle, p.color);
+            }
+
+            // Bots zeichnen
+            bots.forEach(bot => bot.draw());
+
+            // Mich zeichnen
+            drawCar(me.x, me.y, me.angle, me.color);
+
+            ctx.restore();
+
+            requestAnimationFrame(loop);
+        }
+
+        function drawCar(x, y, angle, color) {
+            ctx.save();
+            ctx.translate(x, y);
+            ctx.rotate(angle);
+            
+            // Auto Körper (Neon Style)
+            ctx.fillStyle = color;
+            ctx.shadowBlur = 20;
+            ctx.shadowColor = color;
+            ctx.fillRect(-20, -10, 40, 20); // Hauptkörper
+            
+            // Scheinwerfer
+            ctx.fillStyle = '#fff';
+            ctx.shadowBlur = 10;
+            ctx.fillRect(15, -8, 5, 5);
+            ctx.fillRect(15, 3, 5, 5);
+            
+            ctx.restore();
+        }
+
+        function drawTrack() {
+            ctx.strokeStyle = '#333';
+            ctx.lineWidth = 140;
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.shadowBlur = 0;
+            
+            ctx.beginPath();
+            ctx.moveTo(trackPoints[0].x, trackPoints[0].y);
+            for(let i=1; i<trackPoints.length; i++) {
+                ctx.lineTo(trackPoints[i].x, trackPoints[i].y);
+            }
+            ctx.closePath();
+            ctx.stroke();
+
+            // Mittellinie
+            ctx.strokeStyle = '#555';
+            ctx.lineWidth = 2;
+            ctx.setLineDash([20, 20]);
+            ctx.stroke();
+            ctx.setLineDash([]);
+        }
+
+        // === SOCKET EVENTS (Multiplayer) ===
+        if(socket) {
+            socket.on('currentPlayers', (players) => {
+                others = players;
+                delete others[socket.id];
+            });
+            socket.on('newPlayer', (data) => {
+                others[data.id] = data.player;
+            });
+            socket.on('playerMoved', (data) => {
+                if(others[data.id]) {
+                    others[data.id].x = data.x;
+                    others[data.id].y = data.y;
+                    others[data.id].angle = data.angle;
+                }
+            });
+            socket.on('playerDisconnected', (id) => {
+                delete others[id];
+            });
+        }
+    </script>
+</body>
+</html>
